@@ -2,8 +2,9 @@
 import sqlite3
 import json
 from sqlite3 import Connection
-
 from googleapiclient.discovery import Resource
+
+import auth
 
 
 def _setup_db(db_path='emails.db') -> Connection:
@@ -12,32 +13,38 @@ def _setup_db(db_path='emails.db') -> Connection:
     c = conn.cursor()
 
     # Create table for storing metadata
-    c.execute(
-        '''
+    c.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY, 
             thread_id TEXT,
             label_ids TEXT,
+            sender TEXT,            -- Add sender field
             snippet TEXT,
             history_id TEXT,
             internal_date INTEGER,
             size_estimate INTEGER
-         )
-         '''
-    )
+        )
+    ''')
 
     # Create table for storing metadata (history ID tracking)
-    c.execute(
-        '''
+    c.execute('''
         CREATE TABLE IF NOT EXISTS metadata (
             key TEXT PRIMARY KEY, 
             value TEXT
         )
-        '''
-    )
+    ''')
 
     conn.commit()
     return conn
+
+
+def _extract_sender(message) -> str:
+    """Extract sender email from message headers."""
+    headers = message.get('payload', {}).get('headers', [])
+    for header in headers:
+        if header['name'] == 'From':
+            return header['value']
+    return 'Unknown Sender'
 
 
 def _fetch_paginated_data(list_func, **kwargs):
@@ -52,22 +59,25 @@ def _fetch_paginated_data(list_func, **kwargs):
         response = list_func(**kwargs).execute()
 
 
-class GmailDB(object):
+class GmailDB:
     conn: Connection = None
 
-    def __init__(self, service: Resource, user_id: str):
-        # Get the authenticated user's email (user_id)
-        user_profile = service.users().getProfile(userId='me').execute()
-        user_id = user_profile['emailAddress']  # This is the user's email address
+    def __init__(self):
+        pass
 
-        # Use the user's email to create a database path
-        db_path = f"{user_id}.db"
+    def __enter__(self):
+        self.service = service = auth.authenticate_gmail("client_secret_196809605420-0jngb9rocnvqgeh0dv27ihq27s3ufi1a.apps.googleusercontent.com.json")
+
+        user_profile = service.users().getProfile(userId='me').execute()
+        self.user_id = user_profile['emailAddress']
+
+        db_path = f"{self.user_id}.db"
 
         self.conn = _setup_db(db_path=db_path)
-        self.service = service
-        self.user_id = user_id
 
-    def __close__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.conn.close()
 
     def _set_history_id(self, history_id):
@@ -95,19 +105,21 @@ class GmailDB(object):
         history_id = message.get('historyId', '')
         internal_date = message.get('internalDate', 0)
         size_estimate = message.get('sizeEstimate', 0)
+        sender = _extract_sender(message)
 
-        # Insert or replace in the table, including message size estimate
-        c.execute('''INSERT OR REPLACE INTO messages 
-                     (id, thread_id, label_ids, snippet, history_id, internal_date, size_estimate)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                  (message_id, thread_id, label_ids, snippet, history_id, internal_date, size_estimate))
+        # Insert or replace in the table, including message size estimate and sender
+        c.execute('''
+            INSERT OR REPLACE INTO messages 
+            (id, thread_id, label_ids, sender, snippet, history_id, internal_date, size_estimate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (message_id, thread_id, label_ids, sender, snippet, history_id, internal_date, size_estimate))
         self.conn.commit()
 
     def _fetch_and_store_messages(self, messages):
         """Helper function to fetch full metadata and store it."""
         for message_meta in messages:
-            message = self.service.users().messages().get(userId=self.user_id, id=message_meta['id'],
-                                                          format='metadata').execute()
+            message = self.service.users().messages().get(
+                userId=self.user_id, id=message_meta['id'], format='metadata').execute()
             self._insert_message_metadata(message)
 
     def _sync_full_fetch(self):
@@ -139,7 +151,6 @@ class GmailDB(object):
         except Exception as error:
             print(f"An error occurred while syncing with history: {error}")
 
-
     def _remove_message(self, msg_id):
         """Remove a message from the SQLite database."""
         c = self.conn.cursor()
@@ -153,7 +164,7 @@ class GmailDB(object):
 
         if history_id:
             # Sync using historyId if available
-            self._sync_with_history(history_id, )
+            self._sync_with_history(history_id)
         else:
             # If no historyId, perform a full fetch
             self._sync_full_fetch()
@@ -166,4 +177,31 @@ class GmailDB(object):
             print(f"An error occurred while updating historyId: {error}")
 
     def get_messages_by_sender(self):
-        pass
+        """Return a dict of each sender mapped to:
+           - the list of messages from that sender
+           - the total size of the messages from that sender
+           - the total number of messages from that sender
+        """
+        c = self.conn.cursor()
+        query = '''
+            SELECT sender, GROUP_CONCAT(id), SUM(size_estimate), COUNT(*)
+            FROM messages
+            GROUP BY sender
+        '''
+        c.execute(query)
+        results = c.fetchall()
+
+        senders_dict = {}
+        for row in results:
+            sender = row[0]
+            message_ids = row[1].split(',') if row[1] else []
+            total_size = row[2]
+            message_count = row[3]
+
+            senders_dict[sender] = {
+                'messages': message_ids,
+                'total_size': total_size,
+                'message_count': message_count
+            }
+
+        return senders_dict
