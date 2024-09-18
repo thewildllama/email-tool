@@ -1,11 +1,10 @@
 # gmail_db.py
-import sqlite3
 import json
 import re
+import sqlite3
 from sqlite3 import Connection
-from time import perf_counter, sleep
+from time import sleep
 
-import googleapiclient
 from googleapiclient.errors import HttpError
 
 import auth
@@ -68,26 +67,34 @@ def _extract_sender(message) -> tuple:
     return sender_name, sender_email, sender_domain
 
 
-def _fetch_paginated_data(list_func, **kwargs):
+def _fetch_paginated_data(list_func, generator_func, **kwargs):
     """Helper method for handling pagination."""
-    response = list_func(**kwargs).execute()
+    response = _call_list_and_back_off_if_needed(kwargs, list_func)
+
     while response:
-        yield response.get('messages', [])
+        yield generator_func(response)
         page_token = response.get('nextPageToken')
         if not page_token:
             break
         kwargs['pageToken'] = page_token
-        try:
+        response = _call_list_and_back_off_if_needed(kwargs, list_func)
+
+
+def _call_list_and_back_off_if_needed(kwargs, list_func):
+    try:
+        response = list_func(**kwargs).execute()
+    except HttpError as error:
+        if error.resp.status == 429:
+            print("Rate limit exceeded. Waiting for 1 seconds...")
+            sleep(1)
             response = list_func(**kwargs).execute()
-        except HttpError as error:
-            if error.resp.status == 429:
-                print("Rate limit exceeded. Waiting for 1 seconds...")
-                sleep(1)
-                response = list_func(**kwargs).execute()
-            elif error.resp.status == 403:
-                print("Rate limit exceeded. Waiting for 10 seconds...")
-                sleep(10)
-                response = list_func(**kwargs).execute()
+        elif error.resp.status == 403:
+            print("Rate limit exceeded. Waiting for 10 seconds...")
+            sleep(10)
+            response = list_func(**kwargs).execute()
+        else:
+            raise error
+    return response
 
 
 class GmailDB:
@@ -97,7 +104,7 @@ class GmailDB:
         pass
 
     def __enter__(self):
-        self.service = service = auth.authenticate_gmail("client_secret_196809605420-0jngb9rocnvqgeh0dv27ihq27s3ufi1a.apps.googleusercontent.com.json")
+        self.service = service = auth.authenticate_gmail("client_secret.json")
 
         user_profile = service.users().getProfile(userId='me').execute()
         self.user_id = user_profile['emailAddress']
@@ -107,12 +114,12 @@ class GmailDB:
         self.conn = _setup_db(db_path=db_path)
 
         # TODO: Add an option to bypass this.
-        with self.conn.cursor() as c:
-            # Query to select all message IDs
-            c.execute("SELECT id FROM messages")
+        c = self.conn.cursor()
+        # Query to select all message IDs
+        c.execute("SELECT id FROM messages")
 
-            # Fetch all message IDs and convert to a set
-            self.already_saved_message_ids = {row[0] for row in c.fetchall()}
+        # Fetch all message IDs and convert to a set
+        self.already_saved_message_ids = {row[0] for row in c.fetchall()}
 
         return self
 
@@ -248,7 +255,7 @@ class GmailDB:
         print("Fetching all messages (no historyId found)...")
 
         for messages_page in _fetch_paginated_data(
-                self.service.users().messages().list, userId=self.user_id, maxResults=500
+                self.service.users().messages().list, lambda msg: msg.get('messages', []), userId=self.user_id, maxResults=500
         ):
             self._fetch_and_store_messages(messages_page)
 
@@ -257,7 +264,7 @@ class GmailDB:
         print(f"Syncing with Gmail history starting from historyId: {history_id}")
         try:
             for history_items in _fetch_paginated_data(
-                    self.service.users().history().list, userId=self.user_id, startHistoryId=history_id):
+                    self.service.users().history().list, lambda msg: msg.get('history', []), userId=self.user_id, startHistoryId=history_id):
                 for record in history_items:
                     if 'messagesAdded' in record:
                         message_ids = [added_message['message']['id'] for added_message in record['messagesAdded']]
@@ -302,9 +309,9 @@ class GmailDB:
         """
         c = self.conn.cursor()
         query = '''
-            SELECT sender, GROUP_CONCAT(id), SUM(size_estimate), COUNT(*)
+            SELECT sender_email, GROUP_CONCAT(id), SUM(size_estimate), COUNT(*)
             FROM messages
-            GROUP BY sender
+            GROUP BY sender_email
         '''
         c.execute(query)
         results = c.fetchall()
@@ -323,3 +330,33 @@ class GmailDB:
             }
 
         return senders_dict
+
+    def delete_messages(self, message_ids):
+        """Delete messages from Gmail and the local SQLite database by message IDs."""
+        if not message_ids:
+            print("No message IDs provided for deletion.")
+            return
+
+        print(f"Deleting {len(message_ids)} messages...")
+
+        batch_size = 1_000
+        try:
+            for i in range(0, len(message_ids), batch_size):
+                batch_ids = message_ids[i:i + batch_size]
+
+                # Call Gmail's batchDelete API method
+                self.service.users().messages().batchDelete(
+                    userId=self.user_id, body={'ids': batch_ids}
+                ).execute()
+
+                print(f"Deleted {len(batch_ids)} messages in this batch.")
+                sleep(1)  # Sleep between batches to avoid rate limits
+        except HttpError as error:
+            print(f"An error occurred while deleting messages: {error}")
+
+        # Remove from SQLite
+        c = self.conn.cursor()
+        c.executemany("DELETE FROM messages WHERE id = ?", [(msg_id,) for msg_id in message_ids])
+        self.conn.commit()
+
+        print(f"Deleted {len(message_ids)} messages.")
