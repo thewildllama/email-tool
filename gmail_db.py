@@ -1,8 +1,12 @@
 # gmail_db.py
 import sqlite3
 import json
+import re
 from sqlite3 import Connection
-from googleapiclient.discovery import Resource
+from time import perf_counter, sleep
+
+import googleapiclient
+from googleapiclient.errors import HttpError
 
 import auth
 
@@ -18,7 +22,10 @@ def _setup_db(db_path='emails.db') -> Connection:
             id TEXT PRIMARY KEY, 
             thread_id TEXT,
             label_ids TEXT,
-            sender TEXT,            -- Add sender field
+            sender TEXT,            
+            sender_name TEXT,
+            sender_email TEXT,
+            sender_domain TEXT,
             snippet TEXT,
             history_id TEXT,
             internal_date INTEGER,
@@ -38,13 +45,27 @@ def _setup_db(db_path='emails.db') -> Connection:
     return conn
 
 
-def _extract_sender(message) -> str:
-    """Extract sender email from message headers."""
+def _extract_sender(message) -> tuple:
+    """Extract sender name, email, and domain from message headers."""
     headers = message.get('payload', {}).get('headers', [])
+    sender_name, sender_email, sender_domain = 'Unknown', 'Unknown', 'Unknown'
+
     for header in headers:
         if header['name'] == 'From':
-            return header['value']
-    return 'Unknown Sender'
+            sender = header['value']
+            match = re.match(r'^(.*?)[\s]*<([^>]+)>$', sender)
+            if match:
+                sender_name = match.group(1).strip()
+                sender_email = match.group(2).strip()
+                sender_domain = sender_email.split('@')[-1] if '@' in sender_email else 'Unknown'
+            else:
+                # If the sender is just an email without a name
+                sender_email = sender.strip('<>')
+                sender_name = sender_email
+                sender_domain = sender_email.split('@')[-1] if '@' in sender_email else 'Unknown'
+            break
+
+    return sender_name, sender_email, sender_domain
 
 
 def _fetch_paginated_data(list_func, **kwargs):
@@ -56,7 +77,17 @@ def _fetch_paginated_data(list_func, **kwargs):
         if not page_token:
             break
         kwargs['pageToken'] = page_token
-        response = list_func(**kwargs).execute()
+        try:
+            response = list_func(**kwargs).execute()
+        except HttpError as error:
+            if error.resp.status == 429:
+                print("Rate limit exceeded. Waiting for 1 seconds...")
+                sleep(1)
+                response = list_func(**kwargs).execute()
+            elif error.resp.status == 403:
+                print("Rate limit exceeded. Waiting for 10 seconds...")
+                sleep(10)
+                response = list_func(**kwargs).execute()
 
 
 class GmailDB:
@@ -74,6 +105,14 @@ class GmailDB:
         db_path = f"{self.user_id}.db"
 
         self.conn = _setup_db(db_path=db_path)
+
+        # TODO: Add an option to bypass this.
+        with self.conn.cursor() as c:
+            # Query to select all message IDs
+            c.execute("SELECT id FROM messages")
+
+            # Fetch all message IDs and convert to a set
+            self.already_saved_message_ids = {row[0] for row in c.fetchall()}
 
         return self
 
@@ -105,32 +144,113 @@ class GmailDB:
         history_id = message.get('historyId', '')
         internal_date = message.get('internalDate', 0)
         size_estimate = message.get('sizeEstimate', 0)
-        sender = _extract_sender(message)
 
-        # Insert or replace in the table, including message size estimate and sender
+        # Extract sender details
+        sender_name, sender_email, sender_domain = _extract_sender(message)
+
+        # Insert or replace in the table, including message size estimate and sender details
         c.execute('''
             INSERT OR REPLACE INTO messages 
-            (id, thread_id, label_ids, sender, snippet, history_id, internal_date, size_estimate)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (message_id, thread_id, label_ids, sender, snippet, history_id, internal_date, size_estimate))
+            (id, thread_id, label_ids, sender, sender_name, sender_email, sender_domain, snippet, history_id, internal_date, size_estimate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (message_id, thread_id, label_ids, sender_email, sender_name, sender_email, sender_domain, snippet, history_id, internal_date, size_estimate))
         self.conn.commit()
 
+    _messages_processed = 0
+
+    def _batched_fetch_metadata_for_ids_and_store(self, message_ids) -> list[str]:
+        """Fetch metadata for a batch of message IDs and store them."""
+
+        messages = []
+        unhandled_ids = []
+
+        def callback(id, resp, ex):
+            if ex:
+                index = int(id) - 1
+                print(f"An error occurred while fetching message request # {id}: {ex}")
+                print(f"Adding {message_ids[index]} to retry list.")
+                unhandled_ids.append(message_ids[index])
+            else:
+                messages.append(resp)
+
+        batch = self.service.new_batch_http_request(callback=callback)
+
+        for message_id in message_ids:
+            if message_id in self.already_saved_message_ids:
+                continue
+            batch.add(
+                self.service.users().messages().get(userId=self.user_id, id=message_id, format='metadata')
+            )
+
+        batch.execute()
+        self._bulk_insert_message_metadata(messages)
+
+        return unhandled_ids
+
+    def _bulk_insert_message_metadata(self, messages):
+        """Insert a batch of messages into the database in one transaction."""
+        c = self.conn.cursor()
+        insert_data = []
+
+        for message in messages:
+            message_id = message['id']
+            thread_id = message['threadId']
+            label_ids = json.dumps(message.get('labelIds', []))
+            snippet = message.get('snippet', '')
+            history_id = message.get('historyId', '')
+            internal_date = message.get('internalDate', 0)
+            size_estimate = message.get('sizeEstimate', 0)
+
+            # Extract sender details
+            sender_name, sender_email, sender_domain = _extract_sender(message)
+
+            # Collect the data for bulk insert
+            insert_data.append((
+                message_id, thread_id, label_ids, sender_email, sender_name,
+                sender_email, sender_domain, snippet, history_id, internal_date, size_estimate
+            ))
+
+        # Perform bulk insert
+        with self.conn:
+            c.executemany('''
+                INSERT OR REPLACE INTO messages 
+                (id, thread_id, label_ids, sender, sender_name, sender_email, sender_domain, snippet, history_id, internal_date, size_estimate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', insert_data)
+
+        # TODO: Add a bypass option for this.
+        for message in messages:
+            self.already_saved_message_ids.add(message['id'])
+
     def _fetch_and_store_messages(self, messages):
-        """Helper function to fetch full metadata and store it."""
-        for message_meta in messages:
-            message = self.service.users().messages().get(
-                userId=self.user_id, id=message_meta['id'], format='metadata').execute()
-            self._insert_message_metadata(message)
+        """Fetch multiple messages in batch using Gmail API's batch request and store them in the database."""
+        batch_size = 25 # https://developers.google.com/gmail/api/guides/handle-errors#batch
+        print(f"Processed {self._messages_processed} message metadata so far... Fetching {len(messages)} more messages...")
+        self._messages_processed += len(messages)
+
+        message_ids = [message_meta['id'] for message_meta in messages]
+
+        retry_ids = []
+
+        # Process messages in batches
+        while len(message_ids) > 0:
+            for i in range(0, len(message_ids), batch_size):
+                batch_ids = message_ids[i:i + batch_size]
+                retry_ids.extend(self._batched_fetch_metadata_for_ids_and_store(batch_ids))
+            print(f"Retrying {len(retry_ids)} messages...")
+            message_ids = retry_ids
+            retry_ids = []
+            sleep(1)
+
 
     def _sync_full_fetch(self):
         """Fetch all messages metadata when there is no historyId, with pagination."""
         print("Fetching all messages (no historyId found)...")
-        try:
-            for messages in _fetch_paginated_data(
-                    self.service.users().messages().list, userId=self.user_id):
-                self._fetch_and_store_messages(messages)
-        except Exception as error:
-            print(f"An error occurred while fetching messages: {error}")
+
+        for messages_page in _fetch_paginated_data(
+                self.service.users().messages().list, userId=self.user_id, maxResults=500
+        ):
+            self._fetch_and_store_messages(messages_page)
 
     def _sync_with_history(self, history_id):
         """Sync messages using the Gmail History API, handling changes since the last historyId."""
@@ -140,11 +260,8 @@ class GmailDB:
                     self.service.users().history().list, userId=self.user_id, startHistoryId=history_id):
                 for record in history_items:
                     if 'messagesAdded' in record:
-                        for added_message in record['messagesAdded']:
-                            message_id = added_message['message']['id']
-                            message = self.service.users().messages().get(
-                                userId=self.user_id, id=message_id, format='metadata').execute()
-                            self._insert_message_metadata(message)
+                        message_ids = [added_message['message']['id'] for added_message in record['messagesAdded']]
+                        self._batched_fetch_metadata_for_ids_and_store(message_ids)
                     if 'messagesDeleted' in record:
                         for deleted_message in record['messagesDeleted']:
                             self._remove_message(deleted_message['message']['id'])
@@ -175,6 +292,7 @@ class GmailDB:
             self._set_history_id(profile['historyId'])
         except Exception as error:
             print(f"An error occurred while updating historyId: {error}")
+
 
     def get_messages_by_sender(self):
         """Return a dict of each sender mapped to:
